@@ -1,0 +1,33 @@
+name: release
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/<jouw-github-gebruikersnaam-in-kleine-letters>/cloud-expert-service
+
+defaults:
+  run:
+    working-directory: examples/node-service
+
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: examples/node-service/package-lock.json
+      - run: npm ci
+      - run: npm test
