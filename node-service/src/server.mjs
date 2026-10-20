@@ -4,7 +4,8 @@ import { pathToFileURL } from 'node:url';
 export function createApp() {
   return createServer((request, response) => {
     if (request.url === '/health') {
-      response.writeHead(200, { 'content-type': 'application/json' });
+      //response.writeHead(200, { 'content-type': 'application/json' });
+      response.writeHead(500, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ status: 'ok' }));
       return;
     }
