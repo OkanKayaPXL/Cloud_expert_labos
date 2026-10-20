@@ -12,22 +12,183 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/<jouw-github-gebruikersnaam-in-kleine-letters>/cloud-expert-service
-
-defaults:
-  run:
-    working-directory: examples/node-service
-
+  IMAGE: ghcr.io/okankayapxl/cloud-expert-service   # kleine letters!
 
 jobs:
+  # ---------- Quality gate ----------
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node-service
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm test
+
+  # ---------- TRACK A: container ----------
+  build-container:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: node-service
+          push: false
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/image.tar
+
+  test-deploy-container:
+    needs: build-container
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp
+      - name: Image laden
+        run: docker load --input /tmp/image.tar
+      - name: Container starten
+        run: docker run --detach --name svc -p 3000:3000 -e PORT=3000 ${{ env.IMAGE }}:${{ github.sha }}
+      - name: Smoke test
+        run: |
+          curl --fail --silent --retry 10 --retry-delay 2 --retry-connrefused \
+            http://localhost:3000/health | tee response.json
+          grep -Eq '"status"\s*:\s*"ok"' response.json
+      - name: Opruimen
+        if: always()
+        run: docker rm --force svc
+
+  production-release-container:
+    needs: test-deploy-container
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp
+      - name: Image laden
+        run: docker load --input /tmp/image.tar
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Taggen en pushen
+        run: |
+          docker tag ${{ env.IMAGE }}:${{ github.sha }} ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+
+  # ---------- TRACK B: binary ----------
+  build-binary:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --omit=dev
+      - name: Archief en checksum maken
+        run: |
+          mkdir -p node_modules dist
+          tar --exclude='.git' --exclude='.github' --exclude='test' \
+            -czf "dist/node-service-${{ github.sha }}.tar.gz" \
+            src package.json package-lock.json node_modules
+          cd dist
+          sha256sum "node-service-${{ github.sha }}.tar.gz" > "node-service-${{ github.sha }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-candidate
+          path: node-service/dist/*
+
+  test-deploy-binary:
+    needs: build-binary
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-candidate
+          path: candidate
+      - name: Checksum controleren
+        working-directory: candidate
+        run: sha256sum -c node-service-${{ github.sha }}.tar.gz.sha256
+      - name: Uitpakken en starten
+        run: |
+          mkdir -p /tmp/app-sandbox
+          tar -xzf candidate/node-service-${{ github.sha }}.tar.gz -C /tmp/app-sandbox
+          PORT=4000 NODE_ENV=test node /tmp/app-sandbox/src/server.mjs &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+      - name: Smoke test
+        run: |
+          curl --fail --silent --retry 10 --retry-delay 2 --retry-connrefused \
+            http://localhost:4000/health | tee response.json
+          grep -Eq '"status"\s*:\s*"ok"' response.json
+      - name: Stoppen
+        if: always()
+        run: kill "$APP_PID" || true
+
+  production-release-binary:
+    needs: test-deploy-binary
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-candidate
+          path: dist
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "v-${{ github.sha }}" \
+            dist/node-service-${{ github.sha }}.tar.gz \
+            dist/node-service-${{ github.sha }}.tar.gz.sha256 \
+            --target ${{ github.sha }} \
+            --title "Release ${{ github.sha }}" \
+            --notes "Automatische release van commit ${{ github.sha }}"
+
+      - name: AWS-credentials (OIDC)
+        if: ${{ vars.ARTIFACT_BUCKET != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload naar S3
+        if: ${{ vars.ARTIFACT_BUCKET != '' }}
+        env:
+          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+        run: |
+          aws s3 cp dist/ "s3://${ARTIFACT_BUCKET}/releases/${{ github.sha }}/" \
+            --recursive \
+            --metadata "git-commit=${{ github.sha }},built-by=github-actions"
