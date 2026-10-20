@@ -62,9 +62,19 @@ jobs:
         run: docker run --detach --name svc -p 3000:3000 -e PORT=3000 ${{ env.IMAGE }}:${{ github.sha }}
       - name: Smoke test
         run: |
-          curl --fail --silent --retry 10 --retry-delay 2 --retry-connrefused \
-            http://localhost:3000/health | tee response.json
+          for i in $(seq 1 15); do
+            if curl --fail --silent http://localhost:3000/health > response.json; then
+              break
+            fi
+            echo "Poging $i mislukt, wacht 2s..."
+            sleep 2
+          done
+          echo "Respons:"
+          cat response.json
           grep -Eq '"status"\s*:\s*"ok"' response.json
+      - name: Container logs (bij fout)
+        if: failure()
+        run: docker logs svc
       - name: Opruimen
         if: always()
         run: docker rm --force svc
